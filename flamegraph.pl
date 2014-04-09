@@ -69,6 +69,8 @@ use strict;
 
 use Getopt::Long;
 
+use Digest::MD5 qw(md5_hex);
+
 # tunables
 my $encoding;
 my $fonttype = "Verdana";
@@ -76,7 +78,7 @@ my $imagewidth = 1200;          # max width, pixels
 my $frameheight = 16;           # max height is dynamic
 my $fontsize = 12;              # base text size
 my $fontwidth = 0.59;           # avg width relative to fontsize
-my $minwidth = 0.1;             # min function width, pixels
+my $minwidth = 1;             # min function width, pixels
 my $titletext = "Flame Graph";  # centered heading
 my $nametype = "Function:";     # what are the names in the data?
 my $countname = "samples";      # what are the counts in the data?
@@ -186,7 +188,7 @@ SVG
 
 		my @g_attr = map {
 			exists $attr->{$_} ? sprintf(qq/$_="%s"/, $attr->{$_}) : ()
-		} qw(class style onmouseover onmouseout);
+		} qw(id class style onmouseover onmouseout);
 		push @g_attr, $attr->{g_extra} if $attr->{g_extra};
 		$self->{svg} .= sprintf qq/<g %s>\n/, join(' ', @g_attr);
 
@@ -326,7 +328,13 @@ sub flow {
 	my $len_b = @$this - 1;
 
 	my $i = 0;
+	my $i2 = 0;
 	my $len_same;
+	my $k;
+	my $tmpId = "";
+	my $digest = "";
+
+	
 	for (; $i <= $len_a; $i++) {
 		last if $i > $len_b;
 		last if $last->[$i] ne $this->[$i];
@@ -334,18 +342,32 @@ sub flow {
 	$len_same = $i;
 
 	for ($i = $len_a; $i >= $len_same; $i--) {
-		my $k = "$last->[$i];$i";
+		$k = "$last->[$i];$i";
 		# a unique ID is constructed from "func;depth;etime";
 		# func-depth isn't unique, it may be repeated later.
 		$Node{"$k;$v"}->{stime} = delete $Tmp{$k}->{stime};
-		delete $Tmp{$k};
+		
+		# to identify nodes in different graphs they need to have consistent id's
+		# so we will generate the id based on the stack
+		$tmpId = "";
+		for ($i2 = $i; $i2 >= 0; $i2--)
+		{
+			$tmpId = "$tmpId;$last->[$i2]";
+		}
+		# get the md5 hash to use as id in the svg to prevent huge id's
+		$digest = md5_hex($tmpId);
+		$Node{"$k;$v"}->{elemId} = $tmpId;
+		
+		delete $Tmp{$k};		
 	}
-
+	
+	
 	for ($i = $len_same; $i <= $len_b; $i++) {
 		my $k = "$this->[$i];$i";
 		$Tmp{$k}->{stime} = $v;
+		
 	}
-
+	
         return $this;
 }
 
@@ -356,16 +378,26 @@ my $time = 0;
 my $ignored = 0;
 foreach (sort @Data) {
 	chomp;
+	#my ($stack, $samples) = (/^(.*)\s+(\d+(?:\.\d*)?)\s+(.+)$/);
 	my ($stack, $samples) = (/^(.*)\s+(\d+(?:\.\d*)?)$/);
 	unless (defined $samples) {
 		++$ignored;
 		next;
 	}
 	$stack =~ tr/<>/()/;
+	
 	$last = flow($last, [ '', split ";", $stack ], $time);
-	$time += $samples;
+	
+	$time += $samples;	
+
+	
 }
+
+
 flow($last, [], $time);
+
+
+	
 warn "Ignored $ignored lines with invalid format\n" if $ignored;
 die "ERROR: No stack counts found\n" unless $time;
 
@@ -410,8 +442,8 @@ my $inc = <<INC;
 <![CDATA[
 	var details;
 	function init(evt) { details = document.getElementById("details").firstChild; }
-	function s(info) { details.nodeValue = "$nametype " + info; }
-	function c() { details.nodeValue = ' '; }
+	function s(info, id) { details.nodeValue = "$nametype " + info; window.parent.highlight(id); }
+	function c(id) { details.nodeValue = ' '; window.parent.unhighlight(id); }
 ]]>
 </script>
 INC
@@ -434,7 +466,8 @@ if ($palette) {
 while (my ($id, $node) = each %Node) {
 	my ($func, $depth, $etime) = split ";", $id;
 	my $stime = $node->{stime};
-
+	my $elemId = $node->{elemId};
+	
 	$etime = $timemax if $func eq "" and $depth == 0;
 
 	my $x1 = $xpad + $stime * $widthpertime;
@@ -457,11 +490,12 @@ while (my ($id, $node) = each %Node) {
 		$escaped_func =~ s/>/&gt;/g;
 		$info = "$escaped_func ($samples_txt $countname, $pct%)";
 	}
-
+	
 	my $nameattr = { %{ $nameattr{$func}||{} } }; # shallow clone
+	$nameattr->{id}		 ||= $elemId;
 	$nameattr->{class}       ||= "func_g";
-	$nameattr->{onmouseover} ||= "s('".$info."')";
-	$nameattr->{onmouseout}  ||= "c()";
+	$nameattr->{onmouseover} ||= "s('".$info."','".$elemId."')";
+	$nameattr->{onmouseout}  ||= "c('".$elemId."')";
 	$nameattr->{title}       ||= $info;
 	$im->group_start($nameattr);
 
@@ -482,7 +516,7 @@ while (my ($id, $node) = each %Node) {
 		$im->stringTTF($black, $fonttype, $fontsize, 0.0, $x1 + 3, 3 + ($y1 + $y2) / 2, $text, "");
 	}
 
-	$im->group_end($nameattr);
+	$im->group_end($nameattr);	
 }
 
 print $im->svg;
