@@ -378,7 +378,6 @@ my $time = 0;
 my $ignored = 0;
 foreach (sort @Data) {
 	chomp;
-	#my ($stack, $samples) = (/^(.*)\s+(\d+(?:\.\d*)?)\s+(.+)$/);
 	my ($stack, $samples) = (/^(.*)\s+(\d+(?:\.\d*)?)$/);
 	unless (defined $samples) {
 		++$ignored;
