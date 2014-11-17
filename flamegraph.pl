@@ -75,6 +75,8 @@ use strict;
 
 use Getopt::Long;
 
+use Digest::MD5 qw(md5_hex);
+
 # tunables
 my $encoding;
 my $fonttype = "Verdana";
@@ -101,6 +103,7 @@ my $negate = 0;                 # switch differential hues
 my $titletext = "";             # centered heading
 my $titledefault = "Flame Graph";	# overwritten by --title
 my $titleinverted = "Icicle Graph";	#   "    "
+my $only_increase = 0;
 
 GetOptions(
 	'fonttype=s'  => \$fonttype,
@@ -122,6 +125,7 @@ GetOptions(
 	'reverse'     => \$stackreverse,
 	'inverted'    => \$inverted,
 	'negate'      => \$negate,
+	'only_increase' => \$only_increase,
 ) or die <<USAGE_END;
 USAGE: $0 [options] infile > outfile.svg\n
 	--title       # change title text
@@ -139,6 +143,7 @@ USAGE: $0 [options] infile > outfile.svg\n
 	--reverse     # generate stack-reversed flame graph
 	--inverted    # icicle graph
 	--negate      # switch differential hues (blue<->red)
+	--only_increase        # graph only increased deltas
 
 	eg,
 	$0 --title="Flame Graph: malloc()" trace.txt > graph.svg
@@ -213,7 +218,7 @@ SVG
 
 		my @g_attr = map {
 			exists $attr->{$_} ? sprintf(qq/$_="%s"/, $attr->{$_}) : ()
-		} qw(class style onmouseover onmouseout onclick);
+		} qw(id class style onmouseover onmouseout onclick);
 		push @g_attr, $attr->{g_extra} if $attr->{g_extra};
 		$self->{svg} .= sprintf qq/<g %s>\n/, join(' ', @g_attr);
 
@@ -414,7 +419,11 @@ sub flow {
 	my $len_b = @$this - 1;
 
 	my $i = 0;
+	my $i2 = 0;
 	my $len_same;
+	my $tmpId = "";
+	my $digest = "";
+
 	for (; $i <= $len_a; $i++) {
 		last if $i > $len_b;
 		last if $last->[$i] ne $this->[$i];
@@ -429,6 +438,18 @@ sub flow {
 		if (defined $Tmp{$k}->{delta}) {
 			$Node{"$k;$v"}->{delta} = delete $Tmp{$k}->{delta};
 		}
+
+		# to identify nodes in different graphs they need to have consistent id's
+		# so we will generate the id based on the stack
+		$tmpId = "";
+		for ($i2 = $i; $i2 >= 0; $i2--)
+		{
+			$tmpId = "$tmpId;$last->[$i2]";
+		}
+		# get the md5 hash to use as id in the svg to prevent huge id's
+		$digest = md5_hex($tmpId);
+		$Node{"$k;$v"}->{elemId} = $digest;
+		
 		delete $Tmp{$k};
 	}
 
@@ -438,6 +459,7 @@ sub flow {
 		if (defined $d) {
 			$Tmp{$k}->{delta} += $i == $len_b ? $d : 0;
 		}
+		
 	}
 
         return $this;
@@ -518,13 +540,21 @@ my $minwidth_time = $minwidth / $widthpertime;
 while (my ($id, $node) = each %Node) {
 	my ($func, $depth, $etime) = split ";", $id;
 	my $stime = $node->{stime};
+	my $delta = $node->{delta};
 	die "missing start for $id" if not defined $stime;
 
 	if (($etime-$stime) < $minwidth_time) {
-		delete $Node{$id};
+		
 		next;
 	}
 	$depthmax = $depth if $depth > $depthmax;
+
+	# also prune if we only want to see the increased blocks
+	if ($only_increase == 1 and defined $delta and $delta <= 0)
+	{
+		delete $Node{$id};
+		next;
+	}
 }
 
 # Draw canvas
@@ -548,8 +578,8 @@ my $inc = <<INC;
 		details = document.getElementById("details").firstChild; 
 		svg = document.getElementsByTagName("svg")[0];
 	}
-	function s(info) { details.nodeValue = "$nametype " + info; }
-	function c() { details.nodeValue = ' '; }
+	function s(info, id) { details.nodeValue = "$nametype " + info; window.parent.highlight(id); }
+	function c(id) { details.nodeValue = ' '; window.parent.unhighlight(id); }
 	function find_child(parent, name, attr) {
 		var children = parent.childNodes;
 		for (var i=0; i<children.length;i++) {
@@ -728,6 +758,7 @@ while (my ($id, $node) = each %Node) {
 	my ($func, $depth, $etime) = split ";", $id;
 	my $stime = $node->{stime};
 	my $delta = $node->{delta};
+	my $elemId = $node->{elemId};
 
 	$etime = $timemax if $func eq "" and $depth == 0;
 
@@ -761,13 +792,15 @@ while (my ($id, $node) = each %Node) {
 			my $deltapct = sprintf "%.2f", ((100 * $delta) / ($timemax * $factor));
 			$deltapct = $delta > 0 ? "+$deltapct" : $deltapct;
 			$info = "$escaped_func ($samples_txt $countname, $pct%; $deltapct%)";
+			
 		}
 	}
 
 	my $nameattr = { %{ $nameattr{$func}||{} } }; # shallow clone
+	$nameattr->{id}		 ||= $elemId;
 	$nameattr->{class}       ||= "func_g";
-	$nameattr->{onmouseover} ||= "s('".$info."')";
-	$nameattr->{onmouseout}  ||= "c()";
+	$nameattr->{onmouseover} ||= "s('".$info."','".$elemId."')";
+	$nameattr->{onmouseout}  ||= "c('".$elemId."')";
 	$nameattr->{onclick}     ||= "zoom(this)";
 	$nameattr->{title}       ||= $info;
 	$im->group_start($nameattr);
