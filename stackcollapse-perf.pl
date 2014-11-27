@@ -21,7 +21,7 @@
 #
 # Example output:
 #
-#  start_kernel;rest_init;cpu_idle;default_idle;native_safe_halt 1
+#  swapper;start_kernel;rest_init;cpu_idle;default_idle;native_safe_halt 1
 #
 # Input may be created and processed using:
 #
@@ -51,6 +51,7 @@
 # CDDL HEADER END
 #
 # 02-Mar-2012	Brendan Gregg	Created this.
+# 02-Jul-2014	   "	  "	Added process name to stacks.
 
 use strict;
 
@@ -62,27 +63,39 @@ sub remember_stack {
 }
 
 my @stack;
+my $pname;
+my $include_pname = 1;	# include process names in stacks
+my $tidy_java = 1;	# condense Java signatures
 
 foreach (<>) {
 	next if m/^#/;
 	chomp;
 
 	if (m/^$/) {
+		if (defined $pname) { unshift @stack, $pname; }
 		remember_stack(join(";", @stack), 1) if @stack;
 		undef @stack;
+		undef $pname;
 		next;
 	}
 
-	# Note the details skipped below, and customize as desired
-
-	if (m/:.*:\s$/) {
-		# skip summary lines
-		next;
-	}
-
-	if (/^\s*\w+\s*(.+) (\S+)/) {
+	if (/^(\S+)\s/) {
+		$include_pname and $pname = $1;	# else skip this line
+	} elsif (/^\s*\w+\s*(.+) (\S+)/) {
 		my ($func, $mod) = ($1, $2);
 		next if $func =~ /^\(/;		# skip process names
+		if ($tidy_java) {
+			# eg, convert the following:
+			#	Lorg/mozilla/javascript/ContextFactory;.call(Lorg/mozilla/javascript/ContextAction;)Ljava/lang/Object;
+			#	Lorg/mozilla/javascript/MemberBox;.<init>(Ljava/lang/reflect/Method;)V
+			# into:
+			#	org/mozilla/javascript/ContextFactory:.call
+			#	org/mozilla/javascript/MemberBox:.init
+			$func =~ s/;/:/g;
+			$func =~ tr/<>//d;
+			$func =~ s/\(.*\).*//;
+			$func =~ s/^L// if $func =~ m:/:;
+		}
 		unshift @stack, $func;
 	} else {
 		warn "Unrecognized line: $_";

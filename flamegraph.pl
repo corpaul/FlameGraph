@@ -17,6 +17,11 @@
 # of the line.  These can be generated using DTrace with stackcollapse.pl,
 # and other tools using the stackcollapse variants.
 #
+# An optional extra column of counts can be provided to generate a differential
+# flame graph of the counts, colored red for more, and blue for less.  This
+# can be useful when using flame graphs for non-regression testing.
+# See the header comment in the difffolded.pl program for instructions.
+#
 # The output graph shows relative presence of functions in stack samples.  The
 # ordering on the x-axis has no meaning; since the data is samples, time order
 # of events is not known.  The order used sorts function names alphabetically.
@@ -26,7 +31,8 @@
 # can use --title to set the title to reflect the content, and --countname
 # to change "samples" to "bytes" etc.
 #
-# There are a few different palettes, selectable using --color.  Functions
+# There are a few different palettes, selectable using --color.  By default,
+# the colors are selected at random (except for differentials).  Functions
 # called "-" will be printed gray, which can be used for stack separators (eg,
 # between user and kernel stacks).
 #
@@ -79,7 +85,6 @@ my $frameheight = 16;           # max height is dynamic
 my $fontsize = 12;              # base text size
 my $fontwidth = 0.59;           # avg width relative to fontsize
 my $minwidth = 0.1;             # min function width, pixels
-my $titletext = "Flame Graph";  # centered heading
 my $nametype = "Function:";     # what are the names in the data?
 my $countname = "samples";      # what are the counts in the data?
 my $colors = "hot";             # color theme
@@ -92,6 +97,13 @@ my $hash = 0;                   # color by function name
 my $palette = 0;                # if we use consistent palettes (default off)
 my %palette_map;                # palette map hash
 my $pal_file = "palette.map";   # palette map file name
+my $stackreverse = 0;           # reverse stack order, switching merge end
+my $inverted = 0;               # icicle graph
+my $negate = 0;                 # switch differential hues
+my $titletext = "";             # centered heading
+my $titledefault = "Flame Graph";	# overwritten by --title
+my $titleinverted = "Icicle Graph";	#   "    "
+my $only_increase = 0;
 
 GetOptions(
 	'fonttype=s'  => \$fonttype,
@@ -110,6 +122,10 @@ GetOptions(
 	'colors=s'    => \$colors,
 	'hash'        => \$hash,
 	'cp'          => \$palette,
+	'reverse'     => \$stackreverse,
+	'inverted'    => \$inverted,
+	'negate'      => \$negate,
+	'only_increase' => \$only_increase,
 ) or die <<USAGE_END;
 USAGE: $0 [options] infile > outfile.svg\n
 	--title       # change title text
@@ -120,9 +136,14 @@ USAGE: $0 [options] infile > outfile.svg\n
 	--fontsize    # font size (default 12)
 	--countname   # count type label (default "samples")
 	--nametype    # name type label (default "Function:")
-	--colors      # "hot", "mem", "io" palette (default "hot")
+	--colors      # set color palette. choices are: hot (default), mem, io,
+	              # java, red, green, blue, yellow, purple, orange
 	--hash        # colors are keyed by function name hash
 	--cp          # use consistent palette (palette.map)
+	--reverse     # generate stack-reversed flame graph
+	--inverted    # icicle graph
+	--negate      # switch differential hues (blue<->red)
+	--only_increase        # graph only increased deltas
 
 	eg,
 	$0 --title="Flame Graph: malloc()" trace.txt > graph.svg
@@ -132,9 +153,18 @@ USAGE_END
 my $ypad1 = $fontsize * 4;      # pad top, include title
 my $ypad2 = $fontsize * 2 + 10; # pad bottom, include labels
 my $xpad = 10;                  # pad lefm and right
+my $framepad = 1;		# vertical padding for frames
 my $depthmax = 0;
 my %Events;
 my %nameattr;
+
+if ($titletext eq "") {
+	unless ($inverted) {
+		$titletext = $titledefault;
+	} else {
+		$titletext = $titleinverted;
+	}
+}
 
 if ($nameattrfile) {
 	# The name-attribute file format is a function name followed by a tab then
@@ -188,7 +218,7 @@ SVG
 
 		my @g_attr = map {
 			exists $attr->{$_} ? sprintf(qq/$_="%s"/, $attr->{$_}) : ()
-		} qw(id class style onmouseover onmouseout);
+		} qw(id class style onmouseover onmouseout onclick);
 		push @g_attr, $attr->{g_extra} if $attr->{g_extra};
 		$self->{svg} .= sprintf qq/<g %s>\n/, join(' ', @g_attr);
 
@@ -223,6 +253,7 @@ SVG
 
 	sub stringTTF {
 		my ($self, $color, $font, $size, $angle, $x, $y, $str, $loc, $extra) = @_;
+		$x = sprintf "%0.2f", $x;
 		$loc = defined $loc ? $loc : "left";
 		$extra = defined $extra ? $extra : "";
 		$self->{svg} .= qq/<text text-anchor="$loc" x="$x" y="$y" font-size="$size" font-family="$font" fill="$color" $extra >$str<\/text>\n/;
@@ -259,6 +290,7 @@ sub namehash {
 sub color {
 	my ($type, $hash, $name) = @_;
 	my ($v1, $v2, $v3);
+
 	if ($hash) {
 		$v1 = namehash($name);
 		$v2 = $v3 = namehash(scalar reverse $name);
@@ -267,6 +299,8 @@ sub color {
 		$v2 = rand(1);
 		$v3 = rand(1);
 	}
+
+	# theme palettes
 	if (defined $type and $type eq "hot") {
 		my $r = 205 + int(50 * $v3);
 		my $g = 0 + int(230 * $v1);
@@ -285,7 +319,64 @@ sub color {
 		my $b = 190 + int(55 * $v2);
 		return "rgb($r,$g,$b)";
 	}
+
+	# multi palettes
+	if (defined $type and $type eq "java") {
+		if ($name =~ /::/) {		# C++
+			$type = "yellow";
+		} elsif ($name =~ m:/:) {	# Java (match "/" in path)
+			$type = "green"
+		} else {			# system
+			$type = "red";
+		}
+		# fall-through to color palettes
+	}
+
+	# color palettes
+	if (defined $type and $type eq "red") {
+		my $r = 200 + int(55 * $v1);
+		my $x = 50 + int(80 * $v1);
+		return "rgb($r,$x,$x)";
+	}
+	if (defined $type and $type eq "green") {
+		my $g = 200 + int(55 * $v1);
+		my $x = 50 + int(60 * $v1);
+		return "rgb($x,$g,$x)";
+	}
+	if (defined $type and $type eq "blue") {
+		my $b = 205 + int(50 * $v1);
+		my $x = 80 + int(60 * $v1);
+		return "rgb($x,$x,$b)";
+	}
+	if (defined $type and $type eq "yellow") {
+		my $x = 175 + int(55 * $v1);
+		my $b = 50 + int(20 * $v1);
+		return "rgb($x,$x,$b)";
+	}
+	if (defined $type and $type eq "purple") {
+		my $x = 190 + int(65 * $v1);
+		my $g = 80 + int(60 * $v1);
+		return "rgb($x,$g,$x)";
+	}
+	if (defined $type and $type eq "orange") {
+		my $r = 190 + int(65 * $v1);
+		my $g = 90 + int(65 * $v1);
+		return "rgb($r,$g,0)";
+	}
+
 	return "rgb(0,0,0)";
+}
+
+sub color_scale {
+	my ($value, $max) = @_;
+	my ($r, $g, $b) = (255, 255, 255);
+	$value = -$value if $negate;
+	if ($value > 0) {
+		$g = $b = int(210 * ($max - $value) / $max);
+	} elsif ($value < 0) {
+		$r = $g = int(210 * ($max + $value) / $max);
+	}
+	return "rgb($r,$g,$b)";
 }
 
 sub color_map {
@@ -322,7 +413,7 @@ my %Node;
 my %Tmp;
 
 sub flow {
-	my ($last, $this, $v) = @_;
+	my ($last, $this, $v, $d) = @_;
 
 	my $len_a = @$last - 1;
 	my $len_b = @$this - 1;
@@ -330,11 +421,9 @@ sub flow {
 	my $i = 0;
 	my $i2 = 0;
 	my $len_same;
-	my $k;
 	my $tmpId = "";
 	my $digest = "";
 
-	
 	for (; $i <= $len_a; $i++) {
 		last if $i > $len_b;
 		last if $last->[$i] ne $this->[$i];
@@ -342,11 +431,14 @@ sub flow {
 	$len_same = $i;
 
 	for ($i = $len_a; $i >= $len_same; $i--) {
-		$k = "$last->[$i];$i";
+		my $k = "$last->[$i];$i";
 		# a unique ID is constructed from "func;depth;etime";
 		# func-depth isn't unique, it may be repeated later.
 		$Node{"$k;$v"}->{stime} = delete $Tmp{$k}->{stime};
-		
+		if (defined $Tmp{$k}->{delta}) {
+			$Node{"$k;$v"}->{delta} = delete $Tmp{$k}->{delta};
+		}
+
 		# to identify nodes in different graphs they need to have consistent id's
 		# so we will generate the id based on the stack
 		$tmpId = "";
@@ -356,47 +448,81 @@ sub flow {
 		}
 		# get the md5 hash to use as id in the svg to prevent huge id's
 		$digest = md5_hex($tmpId);
-		$Node{"$k;$v"}->{elemId} = $tmpId;
+		$Node{"$k;$v"}->{elemId} = $digest;
 		
-		delete $Tmp{$k};		
+		delete $Tmp{$k};
 	}
-	
-	
+
 	for ($i = $len_same; $i <= $len_b; $i++) {
 		my $k = "$this->[$i];$i";
 		$Tmp{$k}->{stime} = $v;
+		if (defined $d) {
+			$Tmp{$k}->{delta} += $i == $len_b ? $d : 0;
+		}
 		
 	}
-	
+
         return $this;
 }
 
 # Parse input
-my @Data = <>;
+my @Data;
 my $last = [];
 my $time = 0;
+my $delta = undef;
 my $ignored = 0;
+my $line;
+my $maxdelta = 1;
+
+# reverse if needed
+foreach (<>) {
+	chomp;
+	$line = $_;
+	if ($stackreverse) {
+		# there may be an extra samples column for differentials
+		# XXX todo: redo these REs as one. It's repeated below.
+		my ($stack, $samples) = (/^(.*)\s+?(\d+(?:\.\d*)?)$/);
+		my $samples2 = undef;
+		if ($stack =~ /^(.*)\s+?(\d+(?:\.\d*)?)$/) {
+			$samples2 = $samples;
+			($stack, $samples) = $stack =~ (/^(.*)\s+?(\d+(?:\.\d*)?)$/);
+			unshift @Data, join(";", reverse split(";", $stack)) . " $samples $samples2";
+		} else {
+			unshift @Data, join(";", reverse split(";", $stack)) . " $samples";
+		}
+	} else {
+		unshift @Data, $line;
+	}
+}
+
+# process and merge frames
 foreach (sort @Data) {
 	chomp;
-	my ($stack, $samples) = (/^(.*)\s+(\d+(?:\.\d*)?)$/);
+	# there may be an extra samples column for differentials
+	my ($stack, $samples) = (/^(.*)\s+?(\d+(?:\.\d*)?)$/);
+	my $samples2 = undef;
+	if ($stack =~ /^(.*)\s+?(\d+(?:\.\d*)?)$/) {
+		$samples2 = $samples;
+		($stack, $samples) = $stack =~ (/^(.*)\s+?(\d+(?:\.\d*)?)$/);
+	}
+	$delta = undef;
+	if (defined $samples2) {
+		$delta = $samples2 - $samples;
+		$maxdelta = abs($delta) if abs($delta) > $maxdelta;
+	}
 	unless (defined $samples) {
 		++$ignored;
 		next;
 	}
 	$stack =~ tr/<>/()/;
-	
-	$last = flow($last, [ '', split ";", $stack ], $time);
-	
-	$time += $samples;	
-
-	
+	$last = flow($last, [ '', split ";", $stack ], $time, $delta);
+	if (defined $samples2) {
+		$time += $samples2;
+	} else {
+		$time += $samples;
+	}
 }
-
-
-flow($last, [], $time);
-
-
-	
+flow($last, [], $time, $delta);
 warn "Ignored $ignored lines with invalid format\n" if $ignored;
 die "ERROR: No stack counts found\n" unless $time;
 
@@ -414,13 +540,21 @@ my $minwidth_time = $minwidth / $widthpertime;
 while (my ($id, $node) = each %Node) {
 	my ($func, $depth, $etime) = split ";", $id;
 	my $stime = $node->{stime};
+	my $delta = $node->{delta};
 	die "missing start for $id" if not defined $stime;
 
 	if (($etime-$stime) < $minwidth_time) {
-		delete $Node{$id};
+		
 		next;
 	}
 	$depthmax = $depth if $depth > $depthmax;
+
+	# also prune if we only want to see the increased blocks
+	if ($only_increase == 1 and defined $delta and $delta <= 0)
+	{
+		delete $Node{$id};
+		next;
+	}
 }
 
 # Draw canvas
@@ -435,14 +569,170 @@ my $inc = <<INC;
 	</linearGradient>
 </defs>
 <style type="text/css">
-	.func_g:hover { stroke:black; stroke-width:0.5; }
+	.func_g:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
 </style>
 <script type="text/ecmascript">
 <![CDATA[
-	var details;
-	function init(evt) { details = document.getElementById("details").firstChild; }
+	var details, svg;
+	function init(evt) { 
+		details = document.getElementById("details").firstChild; 
+		svg = document.getElementsByTagName("svg")[0];
+	}
 	function s(info, id) { details.nodeValue = "$nametype " + info; window.parent.highlight(id); }
 	function c(id) { details.nodeValue = ' '; window.parent.unhighlight(id); }
+	function find_child(parent, name, attr) {
+		var children = parent.childNodes;
+		for (var i=0; i<children.length;i++) {
+			if (children[i].tagName == name)
+				return (attr != undefined) ? children[i].attributes[attr].value : children[i];
+		}
+		return;
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_"+attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_"+attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_"+attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes["width"].value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\\([^(]*\\)/,"");
+		t.attributes["x"].value = parseFloat(r.attributes["x"].value) +3;
+		
+		// Smaller than this size won't fit anything
+		if (w < 2*$fontsize*$fontwidth) {
+			t.textContent = "";
+			return;
+		}
+		
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *\$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+		
+		for (var x=txt.length-2; x>0; x--) {
+			if (t.getSubStringLength(0, x+2) <= w) { 
+				t.textContent = txt.substring(0,x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for(var i=0, c=e.childNodes; i<c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes["x"] != undefined) {
+				orig_save(e, "x");
+				e.attributes["x"].value = (parseFloat(e.attributes["x"].value) - x - $xpad) * ratio + $xpad;
+				if(e.tagName == "text") e.attributes["x"].value = find_child(e.parentNode, "rect", "x") + 3;
+			}
+			if (e.attributes["width"] != undefined) {
+				orig_save(e, "width");
+				e.attributes["width"].value = parseFloat(e.attributes["width"].value) * ratio;
+			}
+		}
+		
+		if (e.childNodes == undefined) return;
+		for(var i=0, c=e.childNodes; i<c.length; i++) {
+			zoom_child(c[i], x-$xpad, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes["x"] != undefined) {
+				orig_save(e, "x");
+				e.attributes["x"].value = $xpad;
+			}
+			if (e.attributes["width"] != undefined) {
+				orig_save(e, "width");
+				e.attributes["width"].value = parseInt(svg.width.baseVal.value) - ($xpad*2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for(var i=0, c=e.childNodes; i<c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) { 
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr["width"].value);
+		var xmin = parseFloat(attr["x"].value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr["y"].value);
+		var ratio = (svg.width.baseVal.value - 2*$xpad) / width;
+		
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+		
+		var unzoombtn = document.getElementById("unzoom");
+		unzoombtn.style["opacity"] = "1.0";
+		
+		var el = document.getElementsByTagName("g");
+		for(var i=0;i<el.length;i++){
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a["x"].value);
+			var ew = parseFloat(a["width"].value);
+			// Is it an ancestor
+			if ($inverted == 0) {
+				var upstack = parseFloat(a["y"].value) > ymin;
+			} else {
+				var upstack = parseFloat(a["y"].value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.style["opacity"] = "0.5";
+					zoom_parent(e);
+					e.onclick = function(e){unzoom(); zoom(this);};
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.style["display"] = "none";
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.style["display"] = "none";
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					e.onclick = function(e){zoom(this);};
+					update_text(e);
+				}
+			}
+		}
+	}
+	function unzoom() {
+		var unzoombtn = document.getElementById("unzoom");
+		unzoombtn.style["opacity"] = "0.0";
+		
+		var el = document.getElementsByTagName("g");
+		for(i=0;i<el.length;i++) {
+			el[i].style["display"] = "block";
+			el[i].style["opacity"] = "1";
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+	}	
 ]]>
 </script>
 INC
@@ -456,23 +746,32 @@ my ($white, $black, $vvdgrey, $vdgrey) = (
     );
 $im->stringTTF($black, $fonttype, $fontsize + 5, 0.0, int($imagewidth / 2), $fontsize * 2, $titletext, "middle");
 $im->stringTTF($black, $fonttype, $fontsize, 0.0, $xpad, $imageheight - ($ypad2 / 2), " ", "", 'id="details"');
+$im->stringTTF($black, $fonttype, $fontsize, 0.0, $xpad, $fontsize * 2,
+    "Reset Zoom", "", 'id="unzoom" onclick="unzoom()" style="opacity:0.0;cursor:pointer"');
 
 if ($palette) {
 	read_palette();
 }
-# Draw frames
 
+# Draw frames
 while (my ($id, $node) = each %Node) {
 	my ($func, $depth, $etime) = split ";", $id;
 	my $stime = $node->{stime};
+	my $delta = $node->{delta};
 	my $elemId = $node->{elemId};
-	
+
 	$etime = $timemax if $func eq "" and $depth == 0;
 
 	my $x1 = $xpad + $stime * $widthpertime;
 	my $x2 = $xpad + $etime * $widthpertime;
-	my $y1 = $imageheight - $ypad2 - ($depth + 1) * $frameheight + 1;
-	my $y2 = $imageheight - $ypad2 - $depth * $frameheight;
+	my ($y1, $y2);
+	unless ($inverted) {
+		$y1 = $imageheight - $ypad2 - ($depth + 1) * $frameheight + $framepad;
+		$y2 = $imageheight - $ypad2 - $depth * $frameheight;
+	} else {
+		$y1 = $ypad1 + $depth * $frameheight;
+		$y2 = $ypad1 + ($depth + 1) * $frameheight - $framepad;
+	}
 
 	my $samples = sprintf "%.0f", ($etime - $stime) * $factor;
 	(my $samples_txt = $samples) # add commas per perlfaq5
@@ -487,35 +786,49 @@ while (my ($id, $node) = each %Node) {
 		$escaped_func =~ s/&/&amp;/g;
 		$escaped_func =~ s/</&lt;/g;
 		$escaped_func =~ s/>/&gt;/g;
-		$info = "$escaped_func ($samples_txt $countname, $pct%)";
+		unless (defined $delta) {
+			$info = "$escaped_func ($samples_txt $countname, $pct%)";
+		} else {
+			my $deltapct = sprintf "%.2f", ((100 * $delta) / ($timemax * $factor));
+			$deltapct = $delta > 0 ? "+$deltapct" : $deltapct;
+			$info = "$escaped_func ($samples_txt $countname, $pct%; $deltapct%)";
+			
+		}
 	}
-	
+
 	my $nameattr = { %{ $nameattr{$func}||{} } }; # shallow clone
 	$nameattr->{id}		 ||= $elemId;
 	$nameattr->{class}       ||= "func_g";
 	$nameattr->{onmouseover} ||= "s('".$info."','".$elemId."')";
 	$nameattr->{onmouseout}  ||= "c('".$elemId."')";
+	$nameattr->{onclick}     ||= "zoom(this)";
 	$nameattr->{title}       ||= $info;
 	$im->group_start($nameattr);
 
-	if ($palette) {
-		$im->filledRectangle($x1, $y1, $x2, $y2, color_map($colors, $func), 'rx="2" ry="2"');
+	my $color;
+	if ($func eq "-") {
+		$color = $vdgrey;
+	} elsif (defined $delta) {
+		$color = color_scale($delta, $maxdelta);
+	} elsif ($palette) {
+		$color = color_map($colors, $func);
 	} else {
-		my $color = $func eq "-" ? $vdgrey : color($colors, $hash, $func);
-		$im->filledRectangle($x1, $y1, $x2, $y2, $color, 'rx="2" ry="2"');
+		$color = color($colors, $hash, $func);
 	}
+	$im->filledRectangle($x1, $y1, $x2, $y2, $color, 'rx="2" ry="2"');
 
 	my $chars = int( ($x2 - $x1) / ($fontsize * $fontwidth));
+	my $text = "";
 	if ($chars >= 3) { # room for one char plus two dots
-		my $text = substr $func, 0, $chars;
+		$text = substr $func, 0, $chars;
 		substr($text, -2, 2) = ".." if $chars < length $func;
 		$text =~ s/&/&amp;/g;
 		$text =~ s/</&lt;/g;
 		$text =~ s/>/&gt;/g;
-		$im->stringTTF($black, $fonttype, $fontsize, 0.0, $x1 + 3, 3 + ($y1 + $y2) / 2, $text, "");
 	}
+	$im->stringTTF($black, $fonttype, $fontsize, 0.0, $x1 + 3, 3 + ($y1 + $y2) / 2, $text, "");
 
-	$im->group_end($nameattr);	
+	$im->group_end($nameattr);
 }
 
 print $im->svg;
